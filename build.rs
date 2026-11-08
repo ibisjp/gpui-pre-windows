@@ -1,3 +1,4 @@
+// Modified by ibis inc. for ibisOffice (2026-11-08): compiles the `textured_quad` shaders.
 #![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
 
 fn main() {
@@ -38,6 +39,7 @@ mod shader_compilation {
             "monochrome_sprite",
             "subpixel_sprite",
             "polychrome_sprite",
+            "textured_quad",
         ];
 
         let rust_binding_path = format!("{}/shaders_bytes.rs", out_dir);

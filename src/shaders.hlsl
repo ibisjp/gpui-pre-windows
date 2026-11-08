@@ -1,3 +1,4 @@
+// Modified by ibis inc. for ibisOffice (2026-11-08): added the textured quad shaders at the end.
 #include "alpha_correction.hlsl"
 
 cbuffer GlobalParams: register(b0) {
@@ -1265,4 +1266,89 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     }
     color.a *= sprite.opacity * saturate(0.5 - distance);
     return color;
+}
+
+/*
+**
+**              Textured quads (ibis: an offscreen texture drawn through a 4x4 transform)
+**
+*/
+
+struct TexturedQuad {
+    uint order;
+    uint texture;
+    float opacity;
+    uint flags;
+    // The rectangle on the plane z = 0, in device pixels.
+    Bounds bounds;
+    Bounds content_mask;
+    // left, top, width, height of the part of the texture drawn, in 0..1.
+    float4 uv;
+    // The transform, column-major.
+    float4 column0;
+    float4 column1;
+    float4 column2;
+    float4 column3;
+    Bounds screen_bounds;
+};
+
+struct TexturedQuadVertexOutput {
+    nointerpolation uint quad_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float2 texture_position: TEXCOORD1;
+};
+
+StructuredBuffer<TexturedQuad> textured_quads: register(t1);
+
+// The homogeneous screen position (x, y, z, w) of a point of the rectangle's plane.
+float4 textured_quad_clip(TexturedQuad quad, float2 plane_position) {
+    return quad.column0 * plane_position.x + quad.column1 * plane_position.y + quad.column3;
+}
+
+TexturedQuadVertexOutput textured_quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    uint quad_id = batch_start_index + instance_id;
+    TexturedQuad quad = textured_quads[quad_id];
+    float2 origin = quad.bounds.origin;
+    float2 extent = quad.bounds.size;
+    float4 clip = textured_quad_clip(quad, origin + unit_vertex * extent);
+
+    TexturedQuadVertexOutput output;
+    // Pixels (x / w, y / w) to normalized device coordinates, kept homogeneous so that the hardware interpolates the
+    // texture with perspective. The depth makes the hardware cut at w = 0.001 (the plane of the eye); no depth test.
+    output.position = float4(
+        clip.x * 2.0 / global_viewport_size.x - clip.w,
+        clip.w - clip.y * 2.0 / global_viewport_size.y,
+        clip.w - 0.001,
+        clip.w);
+    if ((quad.flags & 1u) != 0u) {
+        // Cull the back face: the winding of the rectangle's corners on the screen.
+        float4 c0 = textured_quad_clip(quad, origin);
+        float4 c1 = textured_quad_clip(quad, origin + float2(extent.x, 0.0));
+        float4 c2 = textured_quad_clip(quad, origin + float2(0.0, extent.y));
+        if (c0.w > 0.001 && c1.w > 0.001 && c2.w > 0.001) {
+            float2 p0 = c0.xy / c0.w;
+            float2 p1 = c1.xy / c1.w;
+            float2 p2 = c2.xy / c2.w;
+            float area = (p1.x - p0.x) * (p2.y - p0.y) - (p1.y - p0.y) * (p2.x - p0.x);
+            if (area < 0.0) {
+                output.position = float4(2.0, 2.0, 2.0, 1.0);
+            }
+        }
+    }
+    output.quad_id = quad_id;
+    output.texture_position = quad.uv.xy + unit_vertex * quad.uv.zw;
+    return output;
+}
+
+float4 textured_quad_fragment(TexturedQuadVertexOutput input): SV_Target {
+    TexturedQuad quad = textured_quads[input.quad_id];
+    float2 pixel = input.position.xy;
+    float2 mask_end = quad.content_mask.origin + quad.content_mask.size;
+    if (pixel.x < quad.content_mask.origin.x || pixel.y < quad.content_mask.origin.y ||
+        pixel.x >= mask_end.x || pixel.y >= mask_end.y) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+    // The pass holds premultiplied colors.
+    return t_sprite.SampleLevel(s_sprite, input.texture_position, 0.0) * quad.opacity;
 }

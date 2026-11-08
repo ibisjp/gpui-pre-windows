@@ -1,5 +1,7 @@
+// Modified by ibis inc. for ibisOffice (2026-11-08): offscreen passes and textured quads (a texture drawn through a 4x4 transform).
 // Modified by ibis inc. for ibisOffice (2026-10-01): added `DirectXHeadlessRenderer` (drawing without a window).
 use std::{
+    collections::HashMap,
     slice,
     sync::{Arc, OnceLock},
 };
@@ -55,6 +57,9 @@ pub(crate) struct DirectXRenderer {
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
+
+    /// The render target being drawn to (the window's, or an offscreen pass's), which the path drawing returns to.
+    current_target: Option<ID3D11RenderTargetView>,
 }
 
 /// Direct3D objects
@@ -82,6 +87,19 @@ struct DirectXResources {
 
     // Cached viewport
     viewport: D3D11_VIEWPORT,
+
+    // The textures of the offscreen passes by `OffscreenId`: window-sized (so the viewport and the path intermediate
+    // textures fit them as they are), with the pass drawn in the top left.
+    offscreen_passes: HashMap<u32, OffscreenTarget>,
+}
+
+struct OffscreenTarget {
+    view: ID3D11RenderTargetView,
+    srv: ID3D11ShaderResourceView,
+    /// The size the texture was made at (the swap chain's).
+    size: (u32, u32),
+    /// The size of the pass drawn in it.
+    content: (u32, u32),
 }
 
 struct DirectXRenderPipelines {
@@ -93,12 +111,15 @@ struct DirectXRenderPipelines {
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
+    textured_quads: PipelineState<TexturedQuad>,
 }
 
 struct DirectXGlobalElements {
     global_params_buffer: Option<ID3D11Buffer>,
     batch_params_buffer: Option<ID3D11Buffer>,
     sampler: Option<ID3D11SamplerState>,
+    /// The sampler of the offscreen textures: no wrapping at their edges.
+    sampler_clamp: Option<ID3D11SamplerState>,
 }
 
 struct Annotation<'a>(&'a ID3DUserDefinedAnnotation);
@@ -195,6 +216,7 @@ impl DirectXRenderer {
             width: 1,
             height: 1,
             skip_draws: false,
+            current_target: None,
         })
     }
 
@@ -224,6 +246,7 @@ impl DirectXRenderer {
             width: 1,
             height: 1,
             skip_draws: false,
+            current_target: None,
         })
     }
 
@@ -231,7 +254,11 @@ impl DirectXRenderer {
         self.atlas.clone()
     }
 
-    fn pre_draw(&self, clear_color: &[f32; 4]) -> Result<()> {
+    fn pre_draw(
+        &self,
+        target: &Option<ID3D11RenderTargetView>,
+        clear_color: &[f32; 4],
+    ) -> Result<()> {
         let resources = self.resources.as_ref().expect("resources missing");
         let device_context = &self
             .devices
@@ -252,14 +279,10 @@ impl DirectXRenderer {
         )?;
         unsafe {
             device_context.ClearRenderTargetView(
-                resources
-                    .render_target_view
-                    .as_ref()
-                    .context("missing render target view")?,
+                target.as_ref().context("missing render target view")?,
                 clear_color,
             );
-            device_context
-                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+            device_context.OMSetRenderTargets(Some(slice::from_ref(target)), None);
             device_context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
             device_context
                 .VSSetConstantBuffers(0, Some(slice::from_ref(&self.globals.global_params_buffer)));
@@ -381,10 +404,110 @@ impl DirectXRenderer {
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
-        self.pre_draw(&match background_appearance {
-            WindowBackgroundAppearance::Opaque => [1.0f32; 4],
-            _ => [0.0f32; 4],
-        })?;
+        // The offscreen passes first, each to its own texture, in the order they were painted (so a pass can draw
+        // the textures of the ones before it).
+        let mut used = Vec::new();
+        for pass in &scene.offscreens {
+            if pass.size.width.0 <= 0 || pass.size.height.0 <= 0 {
+                continue;
+            }
+            let target = self.offscreen_target(pass.id.0, pass.size)?;
+            used.push(pass.id.0);
+            self.render_scene(&pass.scene, &Some(target), &[0.0f32; 4])?;
+        }
+        self.resources
+            .as_mut()
+            .context("resources missing")?
+            .offscreen_passes
+            .retain(|id, _| used.contains(id));
+        let target = self
+            .resources
+            .as_ref()
+            .context("resources missing")?
+            .render_target_view
+            .clone();
+        self.render_scene(
+            scene,
+            &target,
+            &match background_appearance {
+                WindowBackgroundAppearance::Opaque => [1.0f32; 4],
+                _ => [0.0f32; 4],
+            },
+        )
+    }
+
+    /// The render target of the offscreen pass `id` for a pass of `size`: a window-sized texture, kept while the
+    /// window's size is the same.
+    fn offscreen_target(
+        &mut self,
+        id: u32,
+        size: Size<DevicePixels>,
+    ) -> Result<ID3D11RenderTargetView> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_mut().context("resources missing")?;
+        let texture_size = (self.width, self.height);
+        let content = (
+            (size.width.0 as u32).min(texture_size.0),
+            (size.height.0 as u32).min(texture_size.1),
+        );
+        if let Some(existing) = resources.offscreen_passes.get_mut(&id) {
+            if existing.size == texture_size {
+                existing.content = content;
+                return Ok(existing.view.clone());
+            }
+        }
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: texture_size.0,
+            Height: texture_size.1,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: RENDER_TARGET_FORMAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut texture = None;
+        unsafe { devices.device.CreateTexture2D(&desc, None, Some(&mut texture))? };
+        let texture = texture.context("creating the offscreen texture")?;
+        let mut view = None;
+        unsafe {
+            devices
+                .device
+                .CreateRenderTargetView(&texture, None, Some(&mut view))?
+        };
+        let mut srv = None;
+        unsafe {
+            devices
+                .device
+                .CreateShaderResourceView(&texture, None, Some(&mut srv))?
+        };
+        let view = view.context("creating the offscreen render target view")?;
+        resources.offscreen_passes.insert(
+            id,
+            OffscreenTarget {
+                view: view.clone(),
+                srv: srv.context("creating the offscreen shader resource view")?,
+                size: texture_size,
+                content,
+            },
+        );
+        Ok(view)
+    }
+
+    /// Clear `target` and encode every primitive batch of `scene` into it.
+    fn render_scene(
+        &mut self,
+        scene: &Scene,
+        target: &Option<ID3D11RenderTargetView>,
+        clear_color: &[f32; 4],
+    ) -> Result<()> {
+        self.pre_draw(target, clear_color)?;
+        self.current_target = target.clone();
         self.upload_scene_buffers(scene)?;
 
         let annotation = self
@@ -415,6 +538,9 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                PrimitiveBatch::TexturedQuads(range) => {
+                    self.draw_textured_quads(range.start, range.len(), scene)
+                }
             }
             .with_context(|| {
                 format!(
@@ -607,6 +733,34 @@ impl DirectXRenderer {
             )?;
         }
 
+        if !scene.textured_quads.is_empty() {
+            // A pass is drawn in the top left of its (window-sized) texture: the quad's part of it, in that.
+            let resources = self.resources.as_ref().context("resources missing")?;
+            let quads: Vec<TexturedQuad> = scene
+                .textured_quads
+                .iter()
+                .map(|quad| {
+                    let mut quad = *quad;
+                    if let Some(pass) = resources.offscreen_passes.get(&quad.texture.0) {
+                        let kx = pass.content.0 as f32 / pass.size.0.max(1) as f32;
+                        let ky = pass.content.1 as f32 / pass.size.1.max(1) as f32;
+                        quad.uv = [
+                            quad.uv[0] * kx,
+                            quad.uv[1] * ky,
+                            quad.uv[2] * kx,
+                            quad.uv[3] * ky,
+                        ];
+                    }
+                    quad
+                })
+                .collect();
+            self.pipelines.textured_quads.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                &quads,
+            )?;
+        }
+
         Ok(())
     }
 
@@ -696,10 +850,10 @@ impl DirectXRenderer {
                 0,
                 RENDER_TARGET_FORMAT,
             );
-            // Restore main render target
+            // Restore the render target being drawn to
             devices
                 .device_context
-                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+                .OMSetRenderTargets(Some(slice::from_ref(&self.current_target)), None);
         }
 
         Ok(())
@@ -837,6 +991,32 @@ impl DirectXRenderer {
         )
     }
 
+    fn draw_textured_quads(&mut self, start: usize, len: usize, scene: &Scene) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        for index in start..start + len {
+            // A texture that was not painted in this frame draws nothing.
+            let Some(pass) = resources
+                .offscreen_passes
+                .get(&scene.textured_quads[index].texture.0)
+            else {
+                continue;
+            };
+            self.pipelines.textured_quads.draw_range_with_texture(
+                &devices.device_context,
+                &[Some(pass.srv.clone())],
+                self.globals
+                    .batch_params_buffer
+                    .as_ref()
+                    .context("batch params buffer missing")?,
+                slice::from_ref(&self.globals.sampler_clamp),
+                index as u32,
+                1,
+            )?;
+        }
+        Ok(())
+    }
+
     fn draw_surfaces(&mut self, surfaces: &[PaintSurface]) -> Result<()> {
         if surfaces.is_empty() {
             return Ok(());
@@ -933,6 +1113,7 @@ impl DirectXResources {
             path_intermediate_msaa_view,
             path_intermediate_srv,
             viewport,
+            offscreen_passes: HashMap::new(),
         })
     }
 
@@ -959,6 +1140,7 @@ impl DirectXResources {
         self.path_intermediate_msaa_view = path_intermediate_msaa_view;
         self.path_intermediate_srv = path_intermediate_srv;
         self.viewport = viewport;
+        self.offscreen_passes.clear();
         Ok(())
     }
 }
@@ -1022,7 +1204,16 @@ impl DirectXRenderPipelines {
             create_blend_state(device)?,
         )?;
 
+        let textured_quads = PipelineState::new(
+            device,
+            "textured_quad_pipeline",
+            ShaderModule::TexturedQuad,
+            4,
+            create_blend_state_premultiplied(device)?,
+        )?;
+
         Ok(Self {
+            textured_quads,
             shadow_pipeline,
             quad_pipeline,
             path_rasterization_pipeline,
@@ -1081,10 +1272,29 @@ impl DirectXGlobalElements {
             output
         };
 
+        let sampler_clamp = unsafe {
+            let desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D11_COMPARISON_ALWAYS,
+                BorderColor: [0.0; 4],
+                MinLOD: 0.0,
+                MaxLOD: D3D11_FLOAT32_MAX,
+            };
+            let mut output = None;
+            device.CreateSamplerState(&desc, Some(&mut output))?;
+            output
+        };
+
         Ok(Self {
             global_params_buffer,
             batch_params_buffer,
             sampler,
+            sampler_clamp,
         })
     }
 }
@@ -1578,6 +1788,25 @@ fn create_blend_state(device: &ID3D11Device) -> Result<ID3D11BlendState> {
 }
 
 #[inline]
+/// For shaders that give premultiplied colors (the textures of the offscreen passes).
+fn create_blend_state_premultiplied(device: &ID3D11Device) -> Result<ID3D11BlendState> {
+    let mut desc = D3D11_BLEND_DESC::default();
+    desc.RenderTarget[0].BlendEnable = true.into();
+    desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    desc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+    desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
+    unsafe {
+        let mut state = None;
+        device.CreateBlendState(&desc, Some(&mut state))?;
+        Ok(state.unwrap())
+    }
+}
+
+#[inline]
 fn create_blend_state_for_subpixel_rendering(device: &ID3D11Device) -> Result<ID3D11BlendState> {
     let mut desc = D3D11_BLEND_DESC::default();
     desc.RenderTarget[0].BlendEnable = true.into();
@@ -1784,6 +2013,7 @@ pub(crate) mod shader_resources {
         MonochromeSprite,
         SubpixelSprite,
         PolychromeSprite,
+        TexturedQuad,
         EmojiRasterization,
     }
 
@@ -1857,6 +2087,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::PolychromeSprite => match target {
                     ShaderTarget::Vertex => POLYCHROME_SPRITE_VERTEX_BYTES,
                     ShaderTarget::Fragment => POLYCHROME_SPRITE_FRAGMENT_BYTES,
+                },
+                ShaderModule::TexturedQuad => match target {
+                    ShaderTarget::Vertex => TEXTURED_QUAD_VERTEX_BYTES,
+                    ShaderTarget::Fragment => TEXTURED_QUAD_FRAGMENT_BYTES,
                 },
                 ShaderModule::EmojiRasterization => match target {
                     ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
@@ -1948,6 +2182,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
+                ShaderModule::TexturedQuad => "textured_quad",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
             }
         }
