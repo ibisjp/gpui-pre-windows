@@ -40,6 +40,7 @@ mod shader_compilation {
             "subpixel_sprite",
             "polychrome_sprite",
             "textured_quad",
+            "textured_mesh",
         ];
 
         let rust_binding_path = format!("{}/shaders_bytes.rs", out_dir);

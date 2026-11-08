@@ -112,6 +112,27 @@ struct DirectXRenderPipelines {
     subpixel_sprites: PipelineState<SubpixelSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
     textured_quads: PipelineState<TexturedQuad>,
+    textured_mesh: MeshPipeline,
+}
+
+/// The shaders and the blend of the triangle meshes (their vertices and indices are made for each mesh).
+struct MeshPipeline {
+    vertex: ID3D11VertexShader,
+    fragment: ID3D11PixelShader,
+    blend_state: ID3D11BlendState,
+}
+
+/// A vertex of a mesh as the shader reads it (32 bytes, as `gpui::MeshVertex`).
+type MeshVertex = gpui::MeshVertex;
+
+#[repr(C)]
+struct MeshParams {
+    columns: [f32; 16],
+    content_mask: [f32; 4],
+    opacity: f32,
+    shade: f32,
+    flags: u32,
+    pad: u32,
 }
 
 struct DirectXGlobalElements {
@@ -541,6 +562,7 @@ impl DirectXRenderer {
                 PrimitiveBatch::TexturedQuads(range) => {
                     self.draw_textured_quads(range.start, range.len(), scene)
                 }
+                PrimitiveBatch::TexturedMeshes(range) => self.draw_textured_meshes(&scene.textured_meshes[range]),
             }
             .with_context(|| {
                 format!(
@@ -991,6 +1013,79 @@ impl DirectXRenderer {
         )
     }
 
+    fn draw_textured_meshes(&mut self, meshes: &[TexturedMesh]) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let context = &devices.device_context;
+        for mesh in meshes {
+            // A texture that was not painted in this frame draws nothing.
+            let Some(pass) = resources.offscreen_passes.get(&mesh.texture.0) else {
+                continue;
+            };
+            let (kx, ky) = (
+                pass.content.0 as f32 / pass.size.0.max(1) as f32,
+                pass.content.1 as f32 / pass.size.1.max(1) as f32,
+            );
+            let vertices: Vec<MeshVertex> = mesh
+                .vertices
+                .iter()
+                .map(|v| MeshVertex::new(v.position, [v.uv[0] * kx, v.uv[1] * ky]))
+                .collect();
+            let vertex_buffer = create_buffer(&devices.device, std::mem::size_of::<MeshVertex>(), vertices.len())?;
+            let vertex_view = create_buffer_view(&devices.device, &vertex_buffer)?;
+            update_buffer(context, &vertex_buffer, &vertices)?;
+            let index_buffer = create_buffer(&devices.device, std::mem::size_of::<u32>(), mesh.indices.len())?;
+            let index_view = create_buffer_view(&devices.device, &index_buffer)?;
+            update_buffer(context, &index_buffer, mesh.indices.as_slice())?;
+            let params_buffer = create_constant_buffer::<MeshParams>(&devices.device)?;
+            let mask = mesh.content_mask.bounds;
+            update_buffer(
+                context,
+                params_buffer.as_ref().context("mesh params buffer")?,
+                &[MeshParams {
+                    columns: mesh.transform,
+                    content_mask: [mask.origin.x.0, mask.origin.y.0, mask.size.width.0, mask.size.height.0],
+                    opacity: mesh.opacity,
+                    shade: mesh.shade,
+                    flags: mesh.flags,
+                    pad: 0,
+                }],
+            )?;
+            // A front triangle is clockwise on the screen (the render target's y is down, as the pixels').
+            let rasterizer = D3D11_RASTERIZER_DESC {
+                FillMode: D3D11_FILL_SOLID,
+                CullMode: if mesh.flags & TexturedQuad::CULL_BACK != 0 { D3D11_CULL_BACK } else { D3D11_CULL_NONE },
+                FrontCounterClockwise: false.into(),
+                DepthBias: 0,
+                DepthBiasClamp: 0.0,
+                SlopeScaledDepthBias: 0.0,
+                DepthClipEnable: true.into(),
+                ScissorEnable: false.into(),
+                MultisampleEnable: true.into(),
+                AntialiasedLineEnable: false.into(),
+            };
+            unsafe {
+                let mut state = None;
+                devices.device.CreateRasterizerState(&rasterizer, Some(&mut state))?;
+                context.RSSetState(state.as_ref());
+                context.VSSetShaderResources(1, Some(&[vertex_view]));
+                context.VSSetShaderResources(2, Some(&[index_view]));
+                context.VSSetConstantBuffers(2, Some(slice::from_ref(&params_buffer)));
+                context.PSSetConstantBuffers(2, Some(slice::from_ref(&params_buffer)));
+                context.PSSetShaderResources(0, Some(&[Some(pass.srv.clone())]));
+                context.PSSetSamplers(0, Some(slice::from_ref(&self.globals.sampler_clamp)));
+                context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                context.VSSetShader(&self.pipelines.textured_mesh.vertex, None);
+                context.PSSetShader(&self.pipelines.textured_mesh.fragment, None);
+                context.OMSetBlendState(&self.pipelines.textured_mesh.blend_state, None, 0xFFFFFFFF);
+                context.DrawInstanced(mesh.indices.len() as u32, 1, 0, 0);
+            }
+        }
+        // The other primitives draw both faces.
+        set_rasterizer_state(&devices.device, context)?;
+        Ok(())
+    }
+
     fn draw_textured_quads(&mut self, start: usize, len: usize, scene: &Scene) -> Result<()> {
         let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_ref().context("resources missing")?;
@@ -1212,7 +1307,20 @@ impl DirectXRenderPipelines {
             create_blend_state_premultiplied(device)?,
         )?;
 
+        let textured_mesh = MeshPipeline {
+            vertex: {
+                let raw_shader = RawShaderBytes::new(ShaderModule::TexturedMesh, ShaderTarget::Vertex)?;
+                create_vertex_shader(device, raw_shader.as_bytes())?
+            },
+            fragment: {
+                let raw_shader = RawShaderBytes::new(ShaderModule::TexturedMesh, ShaderTarget::Fragment)?;
+                create_fragment_shader(device, raw_shader.as_bytes())?
+            },
+            blend_state: create_blend_state_premultiplied(device)?,
+        };
+
         Ok(Self {
+            textured_mesh,
             textured_quads,
             shadow_pipeline,
             quad_pipeline,
@@ -2014,6 +2122,7 @@ pub(crate) mod shader_resources {
         SubpixelSprite,
         PolychromeSprite,
         TexturedQuad,
+        TexturedMesh,
         EmojiRasterization,
     }
 
@@ -2091,6 +2200,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::TexturedQuad => match target {
                     ShaderTarget::Vertex => TEXTURED_QUAD_VERTEX_BYTES,
                     ShaderTarget::Fragment => TEXTURED_QUAD_FRAGMENT_BYTES,
+                },
+                ShaderModule::TexturedMesh => match target {
+                    ShaderTarget::Vertex => TEXTURED_MESH_VERTEX_BYTES,
+                    ShaderTarget::Fragment => TEXTURED_MESH_FRAGMENT_BYTES,
                 },
                 ShaderModule::EmojiRasterization => match target {
                     ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
@@ -2183,6 +2296,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
                 ShaderModule::TexturedQuad => "textured_quad",
+                ShaderModule::TexturedMesh => "textured_mesh",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
             }
         }

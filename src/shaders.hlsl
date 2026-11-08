@@ -1358,3 +1358,60 @@ float4 textured_quad_fragment(TexturedQuadVertexOutput input): SV_Target {
     float4 color = t_sprite.SampleLevel(s_sprite, input.texture_position, 0.0);
     return float4(color.rgb * quad.shade, color.a) * quad.opacity;
 }
+
+/*
+**
+**              Textured meshes (ibis: an offscreen texture on a triangle mesh through a 4x4 transform)
+**
+*/
+
+struct MeshVertex {
+    float3 position;
+    float pad0;
+    float2 uv;
+    float2 pad1;
+};
+
+cbuffer MeshParams: register(b2) {
+    float4 mesh_column0;
+    float4 mesh_column1;
+    float4 mesh_column2;
+    float4 mesh_column3;
+    // x, y, width, height
+    float4 mesh_content_mask;
+    float mesh_opacity;
+    float mesh_shade;
+    uint mesh_flags;
+    uint mesh_pad;
+};
+
+StructuredBuffer<MeshVertex> mesh_vertices: register(t1);
+StructuredBuffer<uint> mesh_indices: register(t2);
+
+struct TexturedMeshVertexOutput {
+    float4 position: SV_Position;
+    float2 texture_position: TEXCOORD0;
+};
+
+TexturedMeshVertexOutput textured_mesh_vertex(uint vertex_id: SV_VertexID) {
+    MeshVertex v = mesh_vertices[mesh_indices[vertex_id]];
+    float4 clip = mesh_column0 * v.position.x + mesh_column1 * v.position.y + mesh_column2 * v.position.z + mesh_column3;
+    TexturedMeshVertexOutput output;
+    output.position = float4(
+        clip.x * 2.0 / global_viewport_size.x - clip.w,
+        clip.w - clip.y * 2.0 / global_viewport_size.y,
+        clip.w - 0.001,
+        clip.w);
+    output.texture_position = v.uv;
+    return output;
+}
+
+float4 textured_mesh_fragment(TexturedMeshVertexOutput input): SV_Target {
+    float2 pixel = input.position.xy;
+    float2 mask_end = mesh_content_mask.xy + mesh_content_mask.zw;
+    if (pixel.x < mesh_content_mask.x || pixel.y < mesh_content_mask.y || pixel.x >= mask_end.x || pixel.y >= mask_end.y) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+    float4 color = t_sprite.SampleLevel(s_sprite, input.texture_position, 0.0);
+    return float4(color.rgb * mesh_shade, color.a) * mesh_opacity;
+}
