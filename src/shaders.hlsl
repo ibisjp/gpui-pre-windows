@@ -1279,6 +1279,11 @@ struct TexturedQuad {
     uint texture;
     float opacity;
     uint flags;
+    // Multiplies the colors.
+    float shade;
+    float shade_pad0;
+    float shade_pad1;
+    float shade_pad2;
     // The rectangle on the plane z = 0, in device pixels.
     Bounds bounds;
     Bounds content_mask;
@@ -1350,5 +1355,6 @@ float4 textured_quad_fragment(TexturedQuadVertexOutput input): SV_Target {
         return float4(0.0, 0.0, 0.0, 0.0);
     }
     // The pass holds premultiplied colors.
-    return t_sprite.SampleLevel(s_sprite, input.texture_position, 0.0) * quad.opacity;
+    float4 color = t_sprite.SampleLevel(s_sprite, input.texture_position, 0.0);
+    return float4(color.rgb * quad.shade, color.a) * quad.opacity;
 }
