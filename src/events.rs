@@ -657,6 +657,13 @@ impl WindowsWindowInner {
 
     fn handle_ime_position(&self, handle: HWND) -> Option<isize> {
         if let Some(caret_bounds) = self.retrieve_caret_bounds() {
+            // Modified by ibis inc.: a composition starts with the font the IME lays its windows out by (it is set again only here and
+            // when the direction changes, not at every update of the position, which made the windows flicker).
+            if self.state.ime_vertical.get() {
+                if let Some(ctx) = ImeContext::get(handle) {
+                    set_ime_font(*ctx, true);
+                }
+            }
             self.update_ime_position(handle, caret_bounds);
         }
         Some(0)
@@ -671,9 +678,6 @@ impl WindowsWindowInner {
             return;
         };
         let vertical = self.state.ime_vertical.get();
-        if vertical {
-            set_ime_font(*ctx, true);
-        }
         // Vertical text hangs from the top right corner of its column (the
         // font is turned 270 degrees); the candidates are set beside the
         // column, not over it, as Microsoft Word sets them.
