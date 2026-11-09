@@ -1276,7 +1276,7 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
 
 struct TexturedQuad {
     uint order;
-    uint texture;
+    uint texture_id;
     float opacity;
     uint flags;
     // Multiplies the colors.
