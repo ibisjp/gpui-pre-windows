@@ -794,6 +794,10 @@ impl WindowsWindowInner {
                         &String::from_utf16_lossy(&comp_string),
                         caret_pos,
                     );
+                    // Modified by ibis inc.: which clause is being converted now (Word underlines it thick).
+                    input_handler.set_ime_target_range(
+                        (!comp_string.is_empty()).then(|| retrieve_target_clause(ctx)).flatten(),
+                    );
                 })?;
             }
             if lparam & (GCS_RESULTSTR.0 | GCS_COMPSTR.0) > 0 {
@@ -1770,6 +1774,32 @@ fn parse_ime_composition_string(ctx: HIMC, comp_type: IME_COMPOSITION_STRING) ->
 #[inline]
 fn retrieve_composition_cursor_position(ctx: HIMC) -> usize {
     unsafe { ImmGetCompositionStringW(ctx, GCS_CURSORPOS, None, 0) as usize }
+}
+
+/// Modified by ibis inc.: the clause the input method is converting now, in UTF-16 code units of the composition string: the run
+/// of `ATTR_TARGET_CONVERTED` / `ATTR_TARGET_NOTCONVERTED` in `GCS_COMPATTR` (one attribute byte per UTF-16 unit). `None` when
+/// no unit has either (plain typing is `ATTR_INPUT`; other clauses of a conversion are `ATTR_CONVERTED`).
+fn retrieve_target_clause(ctx: HIMC) -> Option<std::ops::Range<usize>> {
+    let attrs_size = unsafe { ImmGetCompositionStringW(ctx, GCS_COMPATTR, None, 0) };
+    if attrs_size <= 0 {
+        return None;
+    }
+    let mut attrs = vec![0u8; attrs_size as usize];
+    let got = unsafe {
+        ImmGetCompositionStringW(
+            ctx,
+            GCS_COMPATTR,
+            Some(attrs.as_mut_ptr() as *mut _),
+            attrs_size as u32,
+        )
+    };
+    if got <= 0 {
+        return None;
+    }
+    let is_target = |a: u8| a == ATTR_TARGET_CONVERTED as u8 || a == ATTR_TARGET_NOTCONVERTED as u8;
+    let start = attrs.iter().position(|a| is_target(*a))?;
+    let len = attrs[start..].iter().take_while(|a| is_target(**a)).count();
+    Some(start..start + len)
 }
 
 fn should_use_ime_cursor_position(ctx: HIMC, cursor_pos: usize) -> bool {
