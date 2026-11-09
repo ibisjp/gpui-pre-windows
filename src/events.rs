@@ -794,10 +794,12 @@ impl WindowsWindowInner {
                         &String::from_utf16_lossy(&comp_string),
                         caret_pos,
                     );
-                    // Modified by ibis inc.: which clause is being converted now (Word underlines it thick).
-                    input_handler.set_ime_target_range(
-                        (!comp_string.is_empty()).then(|| retrieve_target_clause(ctx)).flatten(),
-                    );
+                    // Modified by ibis inc.: how each clause is underlined (Word: the converted one thick).
+                    input_handler.set_ime_clauses(if comp_string.is_empty() {
+                        Vec::new()
+                    } else {
+                        retrieve_ime_clauses(ctx)
+                    });
                 })?;
             }
             if lparam & (GCS_RESULTSTR.0 | GCS_COMPSTR.0) > 0 {
@@ -1776,13 +1778,14 @@ fn retrieve_composition_cursor_position(ctx: HIMC) -> usize {
     unsafe { ImmGetCompositionStringW(ctx, GCS_CURSORPOS, None, 0) as usize }
 }
 
-/// Modified by ibis inc.: the clause the input method is converting now, in UTF-16 code units of the composition string: the run
-/// of `ATTR_TARGET_CONVERTED` / `ATTR_TARGET_NOTCONVERTED` in `GCS_COMPATTR` (one attribute byte per UTF-16 unit). `None` when
-/// no unit has either (plain typing is `ATTR_INPUT`; other clauses of a conversion are `ATTR_CONVERTED`).
-fn retrieve_target_clause(ctx: HIMC) -> Option<std::ops::Range<usize>> {
+/// Modified by ibis inc.: the clauses of the composition string (UTF-16 code units) from `GCS_COMPATTR`, which has one attribute byte
+/// per UTF-16 unit; neighbours with the same attribute are one clause. The attributes map to [`ImeClause`] as
+/// `ImeClause` documents: `ATTR_INPUT` thin dotted, `ATTR_TARGET_CONVERTED` and `ATTR_TARGET_NOTCONVERTED` thick solid,
+/// `ATTR_CONVERTED` and `ATTR_FIXEDCONVERTED` thin solid, `ATTR_INPUT_ERROR` thin wavy.
+fn retrieve_ime_clauses(ctx: HIMC) -> Vec<ImeClause> {
     let attrs_size = unsafe { ImmGetCompositionStringW(ctx, GCS_COMPATTR, None, 0) };
     if attrs_size <= 0 {
-        return None;
+        return Vec::new();
     }
     let mut attrs = vec![0u8; attrs_size as usize];
     let got = unsafe {
@@ -1794,12 +1797,26 @@ fn retrieve_target_clause(ctx: HIMC) -> Option<std::ops::Range<usize>> {
         )
     };
     if got <= 0 {
-        return None;
+        return Vec::new();
     }
-    let is_target = |a: u8| a == ATTR_TARGET_CONVERTED as u8 || a == ATTR_TARGET_NOTCONVERTED as u8;
-    let start = attrs.iter().position(|a| is_target(*a))?;
-    let len = attrs[start..].iter().take_while(|a| is_target(**a)).count();
-    Some(start..start + len)
+    let style = |a: u8| -> (bool, ImeLine) {
+        match a as u32 {
+            ATTR_INPUT => (false, ImeLine::Dotted),
+            ATTR_TARGET_CONVERTED | ATTR_TARGET_NOTCONVERTED => (true, ImeLine::Solid),
+            ATTR_INPUT_ERROR => (false, ImeLine::Wavy),
+            // ATTR_CONVERTED, ATTR_FIXEDCONVERTED.
+            _ => (false, ImeLine::Solid),
+        }
+    };
+    let mut out: Vec<ImeClause> = Vec::new();
+    for (i, a) in attrs.iter().enumerate() {
+        let (thick, line) = style(*a);
+        match out.last_mut() {
+            Some(last) if last.thick == thick && last.line == line => last.range.end = i + 1,
+            _ => out.push(ImeClause { range: i..i + 1, thick, line }),
+        }
+    }
+    out
 }
 
 fn should_use_ime_cursor_position(ctx: HIMC, cursor_pos: usize) -> bool {
