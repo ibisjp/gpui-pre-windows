@@ -1438,16 +1438,28 @@ fn file_save_dialog(
             .context("failed to canonicalize directory")
             .log_err()
     {
+        // A folder on a network share canonicalizes to `\\?\UNC\server\share\...` (a mapped drive too),
+        // which `dunce` keeps and the shell refuses (E_INVALIDARG): it is given as `\\server\share\...`.
+        // A folder the shell cannot parse only leaves the dialog in its own folder; the dialog still
+        // opens (modified by ibis inc.).
         let full_path = dunce::simplified(&full_path);
         let full_path_string = full_path.display().to_string();
-        let path_item: IShellItem =
-            unsafe { SHCreateItemFromParsingName(&HSTRING::from(full_path_string), None)? };
-        unsafe {
-            dialog
-                .SetFolder(&path_item)
-                .context("failed to set dialog folder")
-                .log_err()
+        let full_path_string = match full_path_string.strip_prefix(r"\\?\UNC\") {
+            Some(rest) => format!(r"\\{rest}"),
+            None => full_path_string,
         };
+        let path_item: Option<IShellItem> =
+            unsafe { SHCreateItemFromParsingName(&HSTRING::from(full_path_string), None) }
+                .context("failed to parse dialog folder")
+                .log_err();
+        if let Some(path_item) = path_item {
+            unsafe {
+                dialog
+                    .SetFolder(&path_item)
+                    .context("failed to set dialog folder")
+                    .log_err()
+            };
+        }
     }
 
     if let Some(suggested_name) = suggested_name {
