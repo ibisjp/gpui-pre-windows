@@ -699,6 +699,32 @@ impl Platform for WindowsPlatform {
         })
     }
 
+    /// The save dialog with a list of file types (modified by ibis inc.: added).
+    fn prompt_for_new_path_with_formats(
+        &self,
+        directory: &Path,
+        suggested_name: Option<&str>,
+        formats: &[SaveFormat],
+    ) -> Receiver<Result<Option<PathBuf>>> {
+        let formats: Vec<(String, Vec<String>)> = formats
+            .iter()
+            .filter(|f| !f.extensions.is_empty())
+            .map(|f| (f.label.to_string(), f.extensions.clone()))
+            .collect();
+        if formats.is_empty() {
+            return self.prompt_for_new_path(directory, suggested_name);
+        }
+        let directory = directory.to_owned();
+        let suggested_name = suggested_name.map(|s| s.to_owned());
+        let owner = self
+            .find_current_active_window()
+            .and_then(|hwnd| self.window_from_hwnd(hwnd))
+            .map(|window| window.dialog_owner.clone());
+        crate::dialog::show_dialog(owner, &self.foreground_executor, move |window| {
+            file_save_dialog_with_formats(directory, suggested_name, &formats, Some(window))
+        })
+    }
+
     fn can_select_mixed_files_and_dirs(&self) -> bool {
         // The FOS_PICKFOLDERS flag toggles between "only files" and "only folders".
         false
@@ -1431,6 +1457,18 @@ fn file_save_dialog(
     suggested_name: Option<String>,
     window: Option<HWND>,
 ) -> Result<Option<PathBuf>> {
+    file_save_dialog_with_formats(directory, suggested_name, &[], window)
+}
+
+/// The save dialog. `formats` (label, extensions) are the file types to choose from; empty: "All files".
+/// The initial type is the one of the suggested name's extension, else the first; a returned path whose
+/// name has none of the formats' extensions gets the chosen type's first one (modified by ibis inc.).
+fn file_save_dialog_with_formats(
+    directory: PathBuf,
+    suggested_name: Option<String>,
+    formats: &[(String, Vec<String>)],
+    window: Option<HWND>,
+) -> Result<Option<PathBuf>> {
     let dialog: IFileSaveDialog = unsafe { CoCreateInstance(&FileSaveDialog, None, CLSCTX_ALL)? };
     if !directory.to_string_lossy().is_empty()
         && let Some(full_path) = directory
@@ -1462,6 +1500,16 @@ fn file_save_dialog(
         }
     }
 
+    let initial = suggested_name
+        .as_deref()
+        .and_then(|n| Path::new(n).extension())
+        .and_then(|e| e.to_str())
+        .and_then(|e| {
+            formats
+                .iter()
+                .position(|f| f.1.iter().any(|x| x.eq_ignore_ascii_case(e)))
+        })
+        .unwrap_or(0);
     if let Some(suggested_name) = suggested_name {
         unsafe {
             dialog
@@ -1471,11 +1519,32 @@ fn file_save_dialog(
         };
     }
 
+    // The strings must outlive the dialog.
+    let names: Vec<HSTRING> = formats.iter().map(|f| HSTRING::from(f.0.as_str())).collect();
+    let specs: Vec<HSTRING> = formats
+        .iter()
+        .map(|f| HSTRING::from(f.1.iter().map(|e| format!("*.{e}")).collect::<Vec<_>>().join(";")))
+        .collect();
     unsafe {
-        dialog.SetFileTypes(&[Common::COMDLG_FILTERSPEC {
-            pszName: windows::core::w!("All files"),
-            pszSpec: windows::core::w!("*.*"),
-        }])?;
+        if formats.is_empty() {
+            dialog.SetFileTypes(&[Common::COMDLG_FILTERSPEC {
+                pszName: windows::core::w!("All files"),
+                pszSpec: windows::core::w!("*.*"),
+            }])?;
+        } else {
+            let filters: Vec<Common::COMDLG_FILTERSPEC> = names
+                .iter()
+                .zip(specs.iter())
+                .map(|(n, s)| Common::COMDLG_FILTERSPEC {
+                    pszName: windows::core::PCWSTR(n.as_ptr()),
+                    pszSpec: windows::core::PCWSTR(s.as_ptr()),
+                })
+                .collect();
+            dialog.SetFileTypes(&filters)?;
+            // The index is 1-based.
+            dialog.SetFileTypeIndex(initial as u32 + 1)?;
+            dialog.SetDefaultExtension(&HSTRING::from(formats[initial].1[0].as_str()))?;
+        }
         if let Err(error) = dialog.Show(window) {
             if error.code() == HRESULT::from_win32(ERROR_CANCELLED.0) {
                 return Ok(None);
@@ -1490,7 +1559,25 @@ fn file_save_dialog(
         CoTaskMemFree(Some(pwstr.0 as _));
         string
     };
-    Ok(Some(PathBuf::from(file_path_string)))
+    let mut path = PathBuf::from(file_path_string);
+    if !formats.is_empty() {
+        let has_format_extension = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| formats.iter().any(|f| f.1.iter().any(|x| x.eq_ignore_ascii_case(e))));
+        if !has_format_extension {
+            // The index is 1-based.
+            let chosen = unsafe { dialog.GetFileTypeIndex() }
+                .map(|i| (i as usize).saturating_sub(1))
+                .unwrap_or(initial)
+                .min(formats.len() - 1);
+            let mut name = path.into_os_string();
+            name.push(".");
+            name.push(&formats[chosen].1[0]);
+            path = PathBuf::from(name);
+        }
+    }
+    Ok(Some(path))
 }
 
 fn load_icon() -> Result<HICON> {
