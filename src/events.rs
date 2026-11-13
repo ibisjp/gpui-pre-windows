@@ -155,6 +155,7 @@ impl WindowsWindowInner {
             WM_CHAR => self.handle_char_msg(wparam),
             WM_IME_STARTCOMPOSITION => self.handle_ime_position(handle),
             WM_IME_COMPOSITION => self.handle_ime_composition(handle, lparam),
+            WM_IME_REQUEST => self.handle_ime_request(wparam, lparam),
             WM_SETCURSOR => self.handle_set_cursor(handle, lparam),
             WM_SETTINGCHANGE => self.handle_system_settings_changed(handle, wparam, lparam),
             WM_INPUTLANGCHANGE => self.handle_input_language_changed(),
@@ -756,6 +757,61 @@ impl WindowsWindowInner {
                     .log_err();
             }
         }
+    }
+
+    /// Modified by ibis inc.: reconversion (the Convert key over selected text, as in Word). The input method asks with
+    /// `IMR_RECONVERTSTRING`, first with no buffer (how many bytes it needs), then with one: the selected text goes in a
+    /// `RECONVERTSTRING`, all of it being the part to convert. It then starts a composition with the converted text, which
+    /// replaces the selection through `replace_and_mark_text_in_range`. Nothing is offered when nothing is selected or a
+    /// composition is running (the request is then left to the default handling).
+    fn handle_ime_request(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+        const IMR_RECONVERTSTRING_CMD: usize = 0x0004;
+        const IMR_CONFIRMRECONVERTSTRING_CMD: usize = 0x0005;
+        if wparam.0 == IMR_CONFIRMRECONVERTSTRING_CMD {
+            // The string is used as offered (returning FALSE: it was not changed).
+            return Some(0);
+        }
+        if wparam.0 != IMR_RECONVERTSTRING_CMD {
+            return None;
+        }
+        let text = self
+            .with_input_handler(|input_handler| {
+                if input_handler.marked_text_range().is_some() {
+                    return None;
+                }
+                let selection = input_handler.selected_text_range(false)?;
+                if selection.range.is_empty() {
+                    return None;
+                }
+                let mut adjusted = None;
+                let text = input_handler.text_for_range(selection.range, &mut adjusted)?;
+                (!text.is_empty()).then_some(text)
+            })
+            .flatten()?;
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let header = std::mem::size_of::<RECONVERTSTRING>();
+        let total = header + (units.len() + 1) * 2;
+        let buffer = lparam.0 as *mut RECONVERTSTRING;
+        if buffer.is_null() {
+            return Some(total as isize);
+        }
+        unsafe {
+            if (*buffer).dwSize < total as u32 {
+                return Some(0);
+            }
+            (*buffer).dwSize = total as u32;
+            (*buffer).dwVersion = 0;
+            (*buffer).dwStrLen = units.len() as u32;
+            (*buffer).dwStrOffset = header as u32;
+            (*buffer).dwCompStrLen = units.len() as u32;
+            (*buffer).dwCompStrOffset = 0;
+            (*buffer).dwTargetStrLen = units.len() as u32;
+            (*buffer).dwTargetStrOffset = 0;
+            let dst = (buffer as *mut u8).add(header) as *mut u16;
+            std::ptr::copy_nonoverlapping(units.as_ptr(), dst, units.len());
+            *dst.add(units.len()) = 0;
+        }
+        Some(total as isize)
     }
 
     fn handle_ime_composition(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
