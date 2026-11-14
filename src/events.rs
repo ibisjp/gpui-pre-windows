@@ -135,6 +135,11 @@ impl WindowsWindowInner {
             WM_NCMBUTTONUP => {
                 self.handle_nc_mouse_up_msg(handle, MouseButton::Middle, wparam, lparam)
             }
+            // ibis inc. (#209): touch fingers (see touch.rs); None lets Windows promote the first one to the mouse.
+            WM_POINTERDOWN => self.handle_pointer_msg(handle, wparam, PointerStage::Down),
+            WM_POINTERUPDATE => self.handle_pointer_msg(handle, wparam, PointerStage::Update),
+            WM_POINTERUP => self.handle_pointer_msg(handle, wparam, PointerStage::Up),
+            WM_POINTERCAPTURECHANGED => self.handle_pointer_msg(handle, wparam, PointerStage::Cancel),
             WM_LBUTTONDOWN => self.handle_mouse_down_msg(handle, MouseButton::Left, lparam),
             WM_RBUTTONDOWN => self.handle_mouse_down_msg(handle, MouseButton::Right, lparam),
             WM_MBUTTONDOWN => self.handle_mouse_down_msg(handle, MouseButton::Middle, lparam),
@@ -367,6 +372,9 @@ impl WindowsWindowInner {
     }
 
     fn handle_mouse_move_msg(&self, handle: HWND, lparam: LPARAM, wparam: WPARAM) -> Option<isize> {
+        if self.touch_mouse_swallowed() {
+            return Some(0);
+        }
         self.start_tracking_mouse(handle, TME_LEAVE);
         self.restore_cursor_after_hide();
 
@@ -490,6 +498,9 @@ impl WindowsWindowInner {
         button: MouseButton,
         lparam: LPARAM,
     ) -> Option<isize> {
+        if self.touch_mouse_swallowed() {
+            return Some(0);
+        }
         unsafe { SetCapture(handle) };
 
         let Some(mut func) = self.state.callbacks.input.take() else {
@@ -520,6 +531,9 @@ impl WindowsWindowInner {
         button: MouseButton,
         lparam: LPARAM,
     ) -> Option<isize> {
+        if self.touch_mouse_swallowed() {
+            return Some(0);
+        }
         unsafe { ReleaseCapture().log_err() };
 
         let Some(mut func) = self.state.callbacks.input.take() else {
@@ -538,6 +552,8 @@ impl WindowsWindowInner {
         });
         let handled = !func(input).propagate;
         self.state.callbacks.input.set(Some(func));
+        // The finger that was promoted to this mouse release is lifted: the touch session ends.
+        self.touch_mouse_released(logical_point(x, y, scale_factor));
 
         if handled { Some(0) } else { Some(1) }
     }

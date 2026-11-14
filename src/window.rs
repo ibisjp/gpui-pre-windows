@@ -67,6 +67,8 @@ pub struct WindowsWindowState {
     pub hovered: Cell<bool>,
     pub last_visibility: Cell<Option<WindowVisibility>>,
     pub direct_manipulation: DirectManipulationHandler,
+    /// Touch screen fingers (ibis inc., #209: see `touch.rs`).
+    pub touch: TouchState,
 
     pub renderer: RefCell<DirectXRenderer>,
     /// Set when the next `draw_window` call must be treated as a forced
@@ -195,6 +197,7 @@ impl WindowsWindowState {
             invalidate_devices,
             draw_coordinator,
             direct_manipulation,
+            touch: TouchState::default(),
             a11y: RefCell::new(None),
         })
     }
