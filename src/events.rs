@@ -814,7 +814,30 @@ impl WindowsWindowInner {
         Some(total as isize)
     }
 
+    /// Modified by ibis inc. (2026-11-14, issue 202): cancels the IME's composition (`CPS_CANCEL`) without telling the input
+    /// handler, as macOS `discardMarkedText` does. The app has already taken the composing text in (and moved to another
+    /// cell), so the `WM_IME_COMPOSITION` messages sent back by the cancel are swallowed instead of putting text or an
+    /// empty replacement into the place now being edited.
+    pub(crate) fn discard_ime_composition(&self, handle: HWND) {
+        if unsafe { GetFocus() } != handle {
+            return;
+        }
+        let Some(ctx) = ImeContext::get(handle) else {
+            return;
+        };
+        self.state.ime_discarding.set(true);
+        unsafe {
+            ImmNotifyIME(*ctx, NI_COMPOSITIONSTR, CPS_CANCEL, 0)
+                .ok()
+                .log_err();
+        }
+        self.state.ime_discarding.set(false);
+    }
+
     fn handle_ime_composition(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
+        if self.state.ime_discarding.get() {
+            return Some(0);
+        }
         let ctx = ImeContext::get(handle)?;
         self.handle_ime_composition_inner(*ctx, lparam)
     }

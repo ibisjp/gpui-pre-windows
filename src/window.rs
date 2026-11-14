@@ -56,6 +56,9 @@ pub struct WindowsWindowState {
     pub callbacks: Callbacks,
     pub input_handler: Cell<Option<PlatformInputHandler>>,
     pub ime_enabled: Cell<bool>,
+    /// Modified by ibis inc. (2026-11-14, issue 202): set while `discard_marked_text` cancels the IME composition, so the
+    /// messages it sends back are not passed to the input handler (the app has taken the composing text in already).
+    pub ime_discarding: Cell<bool>,
     /// Modified by ibis inc.: whether the focused text runs top to bottom.
     pub ime_vertical: Cell<bool>,
     pub pending_surrogate: Cell<Option<u16>>,
@@ -172,6 +175,7 @@ impl WindowsWindowState {
             callbacks,
             input_handler: Cell::new(input_handler),
             ime_enabled: Cell::new(true),
+            ime_discarding: Cell::new(false),
             ime_vertical: Cell::new(false),
             pending_surrogate: Cell::new(pending_surrogate),
             last_reported_modifiers: Cell::new(last_reported_modifiers),
@@ -1060,6 +1064,11 @@ impl PlatformWindow for WindowsWindow {
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {
         let caret = physical_rect(bounds, self.state.scale_factor.get());
         self.0.update_ime_position(self.0.hwnd, caret);
+    }
+
+    // Modified by ibis inc. for ibisOffice (2026-11-14): ends the IME's composition session (issue 202).
+    fn discard_marked_text(&self) {
+        self.0.discard_ime_composition(self.0.hwnd);
     }
 
     // Modified by ibis inc.: the IME is told whether the text is vertical.
