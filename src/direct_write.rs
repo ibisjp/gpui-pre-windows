@@ -49,6 +49,9 @@ use gpui::*;
 #[derive(Debug)]
 struct FontInfo {
     font_family_h: HSTRING,
+    /// The width of the face: normal, but for a face asked for by its Win32 family name (Arial Narrow), which text formats ask
+    /// for as its typographic family (Arial) at that width.
+    font_stretch: DWRITE_FONT_STRETCH,
     font_face: IDWriteFontFace3,
     features: IDWriteTypography,
     fallbacks: Option<IDWriteFontFallback>,
@@ -545,8 +548,41 @@ impl DirectWriteState {
                 )
                 .log_err()?
         };
-        let total_number = unsafe { font.GetFontCount() };
-        for index in 0..total_number {
+        let mut font = font;
+        let mut total_number = unsafe { font.GetFontCount() };
+        // A face of another width (Arial Narrow: width class 3) is in the family of its typographic name (Arial) as
+        // a condensed face, and is not a family of its own; the name Office, GDI and the font's own name table give
+        // it (the Win32 family name: Arial Narrow) finds it. The faces of that name are of one width: the weight
+        // and the style choose among them.
+        let mut by_win32 = false;
+        if total_number == 0 {
+            let value = HSTRING::from(family.as_str());
+            let property = DWRITE_FONT_PROPERTY {
+                propertyId: DWRITE_FONT_PROPERTY_ID_WIN32_FAMILY_NAME,
+                propertyValue: PCWSTR(value.as_ptr()),
+                localeName: w!("en-us"),
+            };
+            if let Some(found) = unsafe { fontset.GetMatchingFonts2(&[property]).log_err() } {
+                font = found;
+                total_number = unsafe { font.GetFontCount() };
+                by_win32 = true;
+            }
+        }
+        let mut order: Vec<u32> = (0..total_number).collect();
+        if by_win32 {
+            let distance = |index: u32| -> (bool, i32) {
+                unsafe {
+                    font.GetFontFaceReference(index)
+                        .ok()
+                        .and_then(|reference| reference.CreateFontFace().ok())
+                        .map_or((true, i32::MAX), |face| {
+                            (face.GetStyle() != font_style_to_dwrite(style), (face.GetWeight().0 - font_weight_to_dwrite(weight).0).abs())
+                        })
+                }
+            };
+            order.sort_by_key(|index| distance(*index));
+        }
+        for index in order {
             let res = maybe!({
                 let font_face_ref = unsafe { font.GetFontFaceReference(index).log_err()? };
                 let font_face = unsafe { font_face_ref.CreateFontFace().log_err()? };
@@ -557,8 +593,17 @@ impl DirectWriteState {
                         .log_err()
                         .flatten()
                 });
+                let (font_family_h, font_stretch) = if by_win32 {
+                    let typographic = unsafe { font_face.GetFamilyNames().log_err() }
+                        .and_then(|names| get_name(names, &HSTRING::from("en-us")).log_err())
+                        .map_or_else(|| font_family_h.clone(), |name| HSTRING::from(name));
+                    (typographic, unsafe { font_face.GetStretch() })
+                } else {
+                    (font_family_h.clone(), DWRITE_FONT_STRETCH_NORMAL)
+                };
                 let font_info = FontInfo {
-                    font_family_h: font_family_h.clone(),
+                    font_family_h,
+                    font_stretch,
                     font_face,
                     features: direct_write_features,
                     fallbacks,
@@ -619,7 +664,7 @@ impl DirectWriteState {
                         collection,
                         font_info.font_face.GetWeight(),
                         font_info.font_face.GetStyle(),
-                        DWRITE_FONT_STRETCH_NORMAL,
+                        font_info.font_stretch,
                         font_size.as_f32(),
                         &components.locale,
                     )?
@@ -678,6 +723,7 @@ impl DirectWriteState {
                 };
                 text_layout.SetFontSize(font_size, text_range)?;
                 text_layout.SetFontStyle(font_info.font_face.GetStyle(), text_range)?;
+                text_layout.SetFontStretch(font_info.font_stretch, text_range)?;
                 text_layout.SetFontWeight(font_info.font_face.GetWeight(), text_range)?;
                 text_layout.SetTypography(&font_info.features, text_range)?;
 
@@ -2039,6 +2085,25 @@ fn get_font_names_from_collection(
             let Some(family_name) = get_name(localized_family_name, locale).log_err() else {
                 continue;
             };
+            // The Win32 family names of the faces of another width than normal (Arial Narrow): Office lists them
+            // as typefaces of their own, and a document names them so.
+            for font_index in 0..font_family.GetFontCount() {
+                let Some(font) = font_family.GetFont(font_index).log_err() else { continue };
+                if font.GetStretch() == DWRITE_FONT_STRETCH_NORMAL {
+                    continue;
+                }
+                let mut names = None;
+                let mut exists = windows::core::BOOL(0);
+                if font.GetInformationalStrings(DWRITE_INFORMATIONAL_STRING_WIN32_FAMILY_NAMES, &mut names, &mut exists).is_ok()
+                    && exists.as_bool()
+                    && let Some(names) = names
+                    && let Some(win32) = get_name(names, locale).log_err()
+                    && win32 != family_name
+                    && !result.contains(&win32)
+                {
+                    result.push(win32);
+                }
+            }
             result.push(family_name);
         }
 
