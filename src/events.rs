@@ -1,3 +1,4 @@
+// Modified by ibis inc. for ibisOffice (2026-11-18, GitHub issue #253): `WM_ERASEBKGND` is handled (nothing is erased).
 use std::{cell::Cell, rc::Rc, sync::atomic::Ordering};
 
 use anyhow::Context as _;
@@ -107,6 +108,9 @@ impl WindowsWindowInner {
             WM_DISPLAYCHANGE => self.handle_display_change_msg(handle),
             WM_NCHITTEST => self.handle_hit_test_msg(handle, lparam),
             WM_PAINT => self.handle_paint_msg(handle),
+            // Modified by ibis inc. (ibisOffice #253): the window is drawn whole by Direct3D; the system must not paint the class's black brush under it while the
+            // window is resized (a window made without DirectComposition has no redirection bitmap to hide the erasing, and CS_HREDRAW | CS_VREDRAW repaint it all).
+            WM_ERASEBKGND => Some(1),
             WM_CLOSE => self.handle_close_msg(),
             WM_DESTROY => self.handle_destroy_msg(handle),
             WM_QUERYENDSESSION => Some(1),
