@@ -1,3 +1,4 @@
+// Modified by ibis inc. for ibisOffice (2026-11-18, GitHub issue #253): `resize` flushes the context before `ResizeBuffers`.
 // Modified by ibis inc. for ibisOffice (2026-11-08): offscreen passes and textured quads (a texture drawn through a 4x4 transform).
 // Modified by ibis inc. for ibisOffice (2026-10-01): added `DirectXHeadlessRenderer` (drawing without a window).
 use std::{
@@ -675,6 +676,11 @@ impl DirectXRenderer {
         let resources = self.resources.as_mut().context("resources missing")?;
         resources.render_target.take();
         resources.render_target_view.take();
+        // Modified by ibis inc. (2026-11-18, ibisOffice #253): Direct3D 11 destroys a released view later, when the context is flushed, and `ResizeBuffers`
+        // fails with DXGI_ERROR_INVALID_CALL while a reference to a back buffer is alive. A failure here invalidates the devices (below), which are made
+        // again with a blank frame (`skip_draws`): the content flashed away while the window was dragged. The render target views are released and unbound
+        // above; flush, so that Direct3D destroys them before the buffers are resized. (Not `ClearState`: the rasterizer state is set once, at the start.)
+        unsafe { devices.device_context.Flush() };
 
         // Resizing the swap chain requires a call to the underlying DXGI adapter, which can return the device removed error.
         // The app might have moved to a monitor that's attached to a different graphics device.
