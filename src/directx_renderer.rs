@@ -669,6 +669,8 @@ impl DirectXRenderer {
         }
         self.width = width;
         self.height = height;
+        // drop our own reference to the back buffer view (set by render_scene), or ResizeBuffers fails with DXGI_ERROR_INVALID_CALL
+        self.current_target = None;
 
         // Clear the render target before resizing
         let devices = self.devices.as_ref().context("devices missing")?;
