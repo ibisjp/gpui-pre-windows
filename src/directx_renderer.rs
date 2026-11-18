@@ -1,4 +1,4 @@
-// Modified by ibis inc. for ibisOffice (2026-11-18, GitHub issue #253): `resize` flushes the context before `ResizeBuffers`.
+// Modified by ibis inc. for ibisOffice (2026-11-18, GitHub issue #253): `resize` drops `current_target` and flushes the context before `ResizeBuffers`.
 // Modified by ibis inc. for ibisOffice (2026-11-08): offscreen passes and textured quads (a texture drawn through a 4x4 transform).
 // Modified by ibis inc. for ibisOffice (2026-10-01): added `DirectXHeadlessRenderer` (drawing without a window).
 use std::{
